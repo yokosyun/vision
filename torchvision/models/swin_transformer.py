@@ -52,7 +52,10 @@ def _get_relative_position_bias(
     N = window_size[0] * window_size[1]
     relative_position_bias = relative_position_bias_table[relative_position_index]  # type: ignore[index]
     relative_position_bias = relative_position_bias.view(N, N, -1)
-    relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)
+    relative_position_bias = (
+        relative_position_bias.permute(2, 0, 1).contiguous()
+        # .unsqueeze(0)
+    )
     return relative_position_bias
 
 
@@ -111,6 +114,55 @@ class PatchMergingV2(nn.Module):
         x = self.reduction(x)  # ... H/2 W/2 2*C
         x = self.norm(x)
         return x
+
+
+def get_attention_mask_for_widow_shift(
+    img_size: List[int],
+    window_size: List[int],
+    shift_size: List[int],
+    num_windows: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tensor:
+    """
+    get mask for attention based on window shift
+    Args:
+        img_size (List[int]): image size [h, w]
+        window_size (List[int]): window size [h, w]
+        shift_size (List[int]): window size [h, w]
+        num_windows (int): number of windows
+        dtype:  (torch.dtype): data type for attention mask
+        device: (torch.device): device for attention mask
+    Returns:
+        Tensor with layout of [..., H/2, W/2, 2*C]
+    """
+    attn_mask = torch.zeros(img_size, dtype=dtype, device=device)
+    h_slices = (
+        (0, -window_size[0]),
+        (-window_size[0], -shift_size[0]),
+        (-shift_size[0], None),
+    )
+    w_slices = (
+        (0, -window_size[1]),
+        (-window_size[1], -shift_size[1]),
+        (-shift_size[1], None),
+    )
+    count = 0
+    for h in h_slices:
+        for w in w_slices:
+            attn_mask[h[0] : h[1], w[0] : w[1]] = count
+            count += 1
+    attn_mask = attn_mask.view(
+        img_size[0] // window_size[0],
+        window_size[0],
+        img_size[1] // window_size[1],
+        window_size[1],
+    )
+    attn_mask = attn_mask.permute(0, 2, 1, 3).reshape(num_windows, window_size[0] * window_size[1])
+    attn_mask = attn_mask.unsqueeze(1) - attn_mask.unsqueeze(2)
+    attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+
+    return attn_mask
 
 
 def shifted_window_attention(
@@ -228,7 +280,166 @@ def shifted_window_attention(
     return x
 
 
+def shifted_window_attention_v2(
+    input: Tensor,
+    qkv_weight: Tensor,
+    proj_weight: Tensor,
+    relative_position_bias: Tensor,
+    window_size: List[int],
+    num_heads: int,
+    shift_size: List[int],
+    attention_dropout: float = 0.0,
+    dropout: float = 0.0,
+    qkv_bias: Optional[Tensor] = None,
+    proj_bias: Optional[Tensor] = None,
+    logit_scale: Optional[torch.Tensor] = None,
+    training: bool = True,
+    use_efficient_attention: bool = False,
+) -> Tensor:
+    """
+    Window based multi-head self attention (W-MSA) module with relative position bias.
+    It supports both of shifted and non-shifted window.
+    Args:
+        input (Tensor[N, H, W, C]): The input tensor or 4-dimensions.
+        qkv_weight (Tensor[in_dim, out_dim]): The weight tensor of query, key, value.
+        proj_weight (Tensor[out_dim, out_dim]): The weight tensor of projection.
+        relative_position_bias (Tensor): The learned relative position bias added to attention.
+        window_size (List[int]): Window size.
+        num_heads (int): Number of attention heads.
+        shift_size (List[int]): Shift size for shifted window attention.
+        attention_dropout (float): Dropout ratio of attention weight. Default: 0.0.
+        dropout (float): Dropout ratio of output. Default: 0.0.
+        qkv_bias (Tensor[out_dim], optional): The bias tensor of query, key, value. Default: None.
+        proj_bias (Tensor[out_dim], optional): The bias tensor of projection. Default: None.
+        logit_scale (Tensor[out_dim], optional): Logit scale of cosine attention for Swin Transformer V2. Default: None.
+        training (bool, optional): Training flag used by the dropout parameters. Default: True.
+        use_efficient_attention (bool, optional): use efficient attention. Default: False.
+    Returns:
+        Tensor[N, H, W, C]: The output tensor after shifted window attention.
+    """
+
+    B, H, W, C = input.shape
+    N = window_size[0] * window_size[1]
+    # print(input.shape, N)
+
+    # pad feature maps to multiples of window size
+    pad_r = (window_size[1] - W % window_size[1]) % window_size[1]
+    pad_b = (window_size[0] - H % window_size[0]) % window_size[0]
+    x = F.pad(input, (0, 0, 0, pad_r, 0, pad_b))
+    _, pad_H, pad_W, _ = x.shape
+
+    shift_size = shift_size.copy()
+    # If window size is larger than feature size, there is no need to shift window
+    if window_size[0] >= pad_H:
+        shift_size[0] = 0
+    if window_size[1] >= pad_W:
+        shift_size[1] = 0
+
+    # cyclic shift
+    if sum(shift_size) > 0:
+        x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1]), dims=(1, 2))
+
+    # partition windows
+    num_windows = (pad_H // window_size[0]) * (pad_W // window_size[1])
+    x = x.view(
+        B,
+        pad_H // window_size[0],
+        window_size[0],
+        pad_W // window_size[1],
+        window_size[1],
+        C,
+    )
+
+    # B, nW, Ws, Ws, C
+    x = x.permute(0, 1, 3, 2, 4, 5)
+    x = x.reshape(B, num_windows, N, C)
+
+    # multi-head attention
+    if logit_scale is not None and qkv_bias is not None:
+        qkv_bias = qkv_bias.clone()
+        length = qkv_bias.numel() // 3
+        qkv_bias[length : 2 * length].zero_()
+
+    qkv = F.linear(x, qkv_weight, qkv_bias)
+    qkv = qkv.reshape(B, num_windows, N, 3, num_heads, C // num_heads)
+    # 3, B, nW, Heads, N, C_PER_HEAD
+    qkv = qkv.permute(3, 0, 1, 4, 2, 5)
+
+    q, k, v = qkv[0], qkv[1], qkv[2]
+
+    if logit_scale is not None:
+        logit_scale = torch.clamp(logit_scale, max=math.log(100.0)).exp()
+        q_norm = F.normalize(q, dim=-1) * logit_scale
+        k_norm = F.normalize(k, dim=-1)
+    else:
+        q_norm = q * (C // num_heads) ** -0.5
+        k_norm = k
+
+    if sum(shift_size) > 0:
+        attn_mask = get_attention_mask_for_widow_shift(
+            img_size=[pad_H, pad_W],
+            window_size=window_size,
+            shift_size=shift_size,
+            num_windows=num_windows,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        attn_mask = attn_mask.unsqueeze(1)
+
+    if use_efficient_attention:
+        if sum(shift_size) > 0:
+            attn_mask = relative_position_bias + attn_mask.repeat_interleave(num_heads, dim=1)
+            attn_mask = relative_position_bias + attn_mask.repeat(1, num_heads, 1, 1)
+        else:
+            attn_mask = relative_position_bias
+
+        attn = torch.nn.functional.scaled_dot_product_attention(
+            q_norm,
+            k_norm,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=attention_dropout if training else 0.0,
+            is_causal=False,
+            scale=1.0,
+        )
+    else:
+        attn_weight = q_norm @ k_norm.transpose(-2, -1)
+        attn_weight = attn_weight + relative_position_bias
+
+        if sum(shift_size) > 0:
+            attn_weight = attn_weight + attn_mask
+
+        attn_weight = F.softmax(attn_weight, dim=-1)
+        attn_weight = F.dropout(attn_weight, p=attention_dropout, training=training)
+        attn = attn_weight @ v
+
+    x = attn.transpose(2, 3).reshape(B * num_windows, N, C)
+
+    x = F.linear(x, proj_weight, proj_bias)
+    x = F.dropout(x, p=dropout, training=training)
+
+    # reverse windows
+    x = x.view(
+        B,
+        pad_H // window_size[0],
+        pad_W // window_size[1],
+        window_size[0],
+        window_size[1],
+        C,
+    )
+    x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, pad_H, pad_W, C)
+
+    # reverse cyclic shift
+    if sum(shift_size) > 0:
+        x = torch.roll(x, shifts=(shift_size[0], shift_size[1]), dims=(1, 2))
+
+    # unpad features
+    x = x[:, :H, :W, :].contiguous()
+    return x
+
+
 torch.fx.wrap("shifted_window_attention")
+torch.fx.wrap("shifted_window_attention_v2")
 
 
 class ShiftedWindowAttention(nn.Module):
@@ -296,7 +507,8 @@ class ShiftedWindowAttention(nn.Module):
             Tensor with same layout as input, i.e. [B, H, W, C]
         """
         relative_position_bias = self.get_relative_position_bias()
-        return shifted_window_attention(
+
+        return shifted_window_attention_v2(
             x,
             self.qkv.weight,
             self.proj.weight,
@@ -309,6 +521,7 @@ class ShiftedWindowAttention(nn.Module):
             qkv_bias=self.qkv.bias,
             proj_bias=self.proj.bias,
             training=self.training,
+            use_efficient_attention=True,
         )
 
 
@@ -381,7 +594,8 @@ class ShiftedWindowAttentionV2(ShiftedWindowAttention):
             Tensor with same layout as input, i.e. [B, H, W, C]
         """
         relative_position_bias = self.get_relative_position_bias()
-        return shifted_window_attention(
+
+        return shifted_window_attention_v2(
             x,
             self.qkv.weight,
             self.proj.weight,
@@ -395,6 +609,7 @@ class ShiftedWindowAttentionV2(ShiftedWindowAttention):
             proj_bias=self.proj.bias,
             logit_scale=self.logit_scale,
             training=self.training,
+            use_efficient_attention=True,
         )
 
 
